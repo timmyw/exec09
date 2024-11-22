@@ -20,7 +20,7 @@
 struct cpu_regs {
 	unsigned X, Y, S, U, PC;
 	unsigned A, B, DP;
-	unsigned H, N, Z, OV, C;
+	unsigned H, N, Z, V, C;
 	unsigned EFI;
 #ifdef H6309
 	unsigned E, F, V, MD;
@@ -28,7 +28,7 @@ struct cpu_regs {
 };
 
 
-struct x_symbol {
+struct symbol {
 	int flags;
 	union {
 		struct named_symbol {
@@ -71,12 +71,11 @@ struct function_call {
 };
 
 void add_named_symbol (const char *id, target_addr_t value, const char *filename);
-struct x_symbol * find_symbol (target_addr_t value);
+struct symbol * find_symbol (target_addr_t value);
 void monitor_branch (void);
 void monitor_call (unsigned int flags);
 void monitor_return (void);
 const char * monitor_addr_name (target_addr_t addr);
-const char * absolute_addr_name (unsigned long addr);
 
-
-
+void monitor_backtrace (void);
+int load_map_file (const char *name);

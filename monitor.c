@@ -1,6 +1,6 @@
 /*
  * Copyright 2001 by Arto Salmi and Joze Fabcic
- * Copyright 2006-2008 by Brian Dominy <brian@oddchange.com>
+ * Copyright 2006 by Brian Dominy <brian@oddchange.com>
  *
  * This file is part of GCC6809.
  *
@@ -8,12 +8,12 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- *
+ * 
  * GCC6809 is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
+ * 
  * You should have received a copy of the GNU General Public License
  * along with GCC6809; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
@@ -26,18 +26,28 @@
 #include <signal.h>
 
 
+/* A container for all symbol table information */
+struct symbol_table symtab;
+
+/* An array of breakpoint objects */
+struct breakpoint bptab[MAX_BREAKPOINTS];
+
 /* The function call stack */
 struct function_call fctab[MAX_FUNCTION_CALLS];
 
 /* The top of the function call stack */
 struct function_call *current_function_call;
 
+/* A bitmask of things to show at the monitor prompt */
+unsigned int prompt_flags;
+
 /* Automatically break after executing this many instructions */
 int auto_break_insn_count = 0;
 
+int do_break = 0;
+
 int monitor_on = 0;
 
-int dump_every_insn = 0;
 
 
 enum addr_mode
@@ -62,11 +72,7 @@ enum opcode
   _orcc, _pshs, _pshu, _puls, _pulu, _rola, _rolb, _rol, _rora,
   _rorb, _ror, _rti, _rts, _sbca, _sbcb, _sex, _sta, _stb,
   _std, _sts, _stu, _stx, _sty, _suba, _subb, _subd, _swi,
-  _swi2, _swi3, _sync, _tfr, _tsta, _tstb, _tst, _reset,
-#ifdef H6309
-  _negd, _comd, _lsrd, _rord, _asrd, _rold, _decd, _incd, _tstd,
-  _clrd
-#endif
+  _swi2, _swi3, _sync, _tfr, _tsta, _tstb, _tst, _reset
 };
 
 char *mne[] = {
@@ -84,11 +90,7 @@ char *mne[] = {
   "ORCC", "PSHS", "PSHU", "PULS", "PULU", "ROLA", "ROLB", "ROL", "RORA",
   "RORB", "ROR", "RTI", "RTS", "SBCA", "SBCB", "SEX", "STA", "STB",
   "STD", "STS", "STU", "STX", "STY", "SUBA", "SUBB", "SUBD", "SWI",
-  "SWI2", "SWI3", "SYNC", "TFR", "TSTA", "TSTB", "TST", "RESET",
-#ifdef H6309
-  "NEGD", "COMD", "LSRD", "RORD", "ASRD", "ROLD", "DECD",
-  "INCD", "TSTD", "CLRD",
-#endif
+  "SWI2", "SWI3", "SYNC", "TFR", "TSTA", "TSTB", "TST", "RESET"
 };
 
 typedef struct
@@ -421,7 +423,7 @@ opcode_t codes10[256] = {
   {_undoc, _illegal},
   {_undoc, _illegal},
   {_swi2, _implied},
-  {_undoc, _illegal}, /* 10 40 */
+  {_undoc, _illegal},
   {_undoc, _illegal},
   {_undoc, _illegal},
   {_undoc, _illegal},
@@ -680,7 +682,7 @@ opcode_t codes11[256] = {
   {_undoc, _illegal},
   {_undoc, _illegal},
   {_swi3, _implied},
-  {_undoc, _illegal}, /* 11 40 */
+  {_undoc, _illegal},
   {_undoc, _illegal},
   {_undoc, _illegal},
   {_undoc, _illegal},
@@ -889,14 +891,74 @@ char *off4[] = {
 };
 
 
-/* Disassemble the current instruction.  Returns the number of bytes that
+void
+add_named_symbol (const char *id, target_addr_t value, const char *filename)
+{
+	struct symbol *sym;
+	static char *last_filename = "";
+	
+	symtab.addr_to_symbol[value] = sym = malloc (sizeof (struct symbol));
+	sym->flags = S_NAMED;
+	sym->u.named.id = symtab.name_area_next;
+	sym->u.named.addr = value;
+
+	strcpy (symtab.name_area_next, id);
+	symtab.name_area_next += strlen (symtab.name_area_next) + 1;
+
+	if (!filename)
+		filename = "";
+
+	if (strcmp (filename, last_filename))
+	{
+		last_filename = symtab.name_area_next;
+		strcpy (last_filename, filename);
+		symtab.name_area_next += strlen (symtab.name_area_next) + 1;
+	}
+	sym->u.named.file = last_filename;
+}
+
+
+struct symbol *
+find_symbol (target_addr_t value)
+{
+	struct symbol *sym;
+
+	while (value > 0)
+	{
+		sym = symtab.addr_to_symbol[value];
+		if (sym)
+			break;
+		else
+			value--;
+	}
+	return sym;
+}
+
+
+struct symbol *
+find_symbol_by_name (const char *id)
+{
+	unsigned int addr;
+	struct symbol *sym;
+
+	for (addr = 0; addr < 0x10000; addr++)
+	{
+		sym = symtab.addr_to_symbol[addr];
+		if (sym && !strcmp (sym->u.named.id, id))
+			return sym;
+	}
+	return NULL;
+}
+
+
+/* Disassemble the current instruction.  Returns the number of bytes that 
 compose it. */
 int
-dasm (char *buf, absolute_address_t opc)
-{
+dasm (char *buf, int opc)
+{				
   UINT8 op, am;
   char *op_str;
-  absolute_address_t pc = opc;
+  int pc = opc & 0xffff;
   char R;
   int fetch1;			/* the first (MSB) fetched byte, used in macro RDWORD */
 
@@ -921,7 +983,6 @@ dasm (char *buf, absolute_address_t opc)
     }
 
   op_str = (char *) mne[op];
-  buf += sprintf (buf, "%-6.6s", op_str);
 
   switch (am)
     {
@@ -929,18 +990,19 @@ dasm (char *buf, absolute_address_t opc)
       sprintf (buf, "???");
       break;
     case _implied:
+      sprintf (buf, "%s ", op_str);
       break;
     case _imm_byte:
-      sprintf (buf, "#$%02X", fetch8 ());
+      sprintf (buf, "%s #$%02X", op_str, fetch8 ());
       break;
     case _imm_word:
-      sprintf (buf, "#$%04X", fetch16 ());
+      sprintf (buf, "%s #$%04X", op_str, fetch16 ());
       break;
     case _direct:
-      sprintf (buf, "<%s", monitor_addr_name (fetch8 ()));
+      sprintf (buf, "%s <%s", op_str, monitor_addr_name (fetch8 ()));
       break;
     case _extended:
-      sprintf (buf, "%s", monitor_addr_name (fetch16 ()));
+      sprintf (buf, "%s %s", op_str, monitor_addr_name (fetch16 ()));
       break;
 
     case _indexed:
@@ -949,104 +1011,105 @@ dasm (char *buf, absolute_address_t opc)
 
       if ((op & 0x80) == 0)
 	{
-	  sprintf (buf, "%s,%c", off4[op & 0x1f], R);
+	  sprintf (buf, "%s %s,%c", op_str, off4[op & 0x1f], R);
 	  break;
 	}
 
       switch (op & 0x1f)
 	{
 	case 0x00:
-	  sprintf (buf, ",%c+", R);
+	  sprintf (buf, "%s ,%c+", op_str, R);
 	  break;
 	case 0x01:
-	  sprintf (buf, ",%c++", R);
+	  sprintf (buf, "%s ,%c++", op_str, R);
 	  break;
 	case 0x02:
-	  sprintf (buf, ",-%c", R);
+	  sprintf (buf, "%s ,-%c", op_str, R);
 	  break;
 	case 0x03:
-	  sprintf (buf, ",--%c", R);
+	  sprintf (buf, "%s ,--%c", op_str, R);
 	  break;
 	case 0x04:
-	  sprintf (buf, ",%c", R);
+	  sprintf (buf, "%s ,%c", op_str, R);
 	  break;
 	case 0x05:
-	  sprintf (buf, "B,%c", R);
+	  sprintf (buf, "%s B,%c", op_str, R);
 	  break;
 	case 0x06:
-	  sprintf (buf, "A,%c", R);
+	  sprintf (buf, "%s A,%c", op_str, R);
 	  break;
 	case 0x08:
-	  sprintf (buf, "$%02X,%c", fetch8 (), R);
+	  sprintf (buf, "%s $%02X,%c", op_str, fetch8 (), R);
 	  break;
 	case 0x09:
-	  sprintf (buf, "$%04X,%c", fetch16 (), R);
+	  sprintf (buf, "%s $%04X,%c", op_str, fetch16 (), R);
 	  break;
 	case 0x0B:
-	  sprintf (buf, "D,%c", R);
+	  sprintf (buf, "%s D,%c", op_str, R);
 	  break;
 	case 0x0C:
-	  sprintf (buf, "$%02X,PC", fetch8 ());
+	  sprintf (buf, "%s $%02X,PC", op_str, fetch8 ());
 	  break;
 	case 0x0D:
-	  sprintf (buf, "$%04X,PC", fetch16 ());
+	  sprintf (buf, "%s $%04X,PC", op_str, fetch16 ());
 	  break;
 	case 0x11:
-	  sprintf (buf, "[,%c++]", R);
+	  sprintf (buf, "%s [,%c++]", op_str, R);
 	  break;
 	case 0x13:
-	  sprintf (buf, "[,--%c]", R);
+	  sprintf (buf, "%s [,--%c]", op_str, R);
 	  break;
 	case 0x14:
-	  sprintf (buf, "[,%c]", R);
+	  sprintf (buf, "%s [,%c]", op_str, R);
 	  break;
 	case 0x15:
-	  sprintf (buf, "[B,%c]", R);
+	  sprintf (buf, "%s [B,%c]", op_str, R);
 	  break;
 	case 0x16:
-	  sprintf (buf, "[A,%c]", R);
+	  sprintf (buf, "%s [A,%c]", op_str, R);
 	  break;
 	case 0x18:
-	  sprintf (buf, "[$%02X,%c]", fetch8 (), R);
+	  sprintf (buf, "%s [$%02X,%c]", op_str, fetch8 (), R);
 	  break;
 	case 0x19:
-	  sprintf (buf, "[$%04X,%c]", fetch16 (), R);
+	  sprintf (buf, "%s [$%04X,%c]", op_str, fetch16 (), R);
 	  break;
 	case 0x1B:
-	  sprintf (buf, "[D,%c]", R);
+	  sprintf (buf, "%s [D,%c]", op_str, R);
 	  break;
 	case 0x1C:
-	  sprintf (buf, "[$%02X,PC]", fetch8 ());
+	  sprintf (buf, "%s [$%02X,PC]", op_str, fetch8 ());
 	  break;
 	case 0x1D:
-	  sprintf (buf, "[$%04X,PC]", fetch16 ());
+	  sprintf (buf, "%s [$%04X,PC]", op_str, fetch16 ());
 	  break;
 	case 0x1F:
-	  sprintf (buf, "[%s]", monitor_addr_name (fetch16 ()));
+	  sprintf (buf, "%s [%s]", op_str, monitor_addr_name (fetch16 ()));
 	  break;
 	default:
-	  sprintf (buf, "???");
+	  sprintf (buf, "%s ??", op_str);
 	  break;
 	}
       break;
 
     case _rel_byte:
       fetch1 = ((INT8) fetch8 ());
-	   sprintf (buf, "%s", absolute_addr_name (fetch1 + pc));
+      sprintf (buf, "%s $%04X", op_str, (fetch1 + pc) & 0xffff);
       break;
 
     case _rel_word:
-	   sprintf (buf, "%s", absolute_addr_name (fetch16 () + pc));
+      sprintf (buf, "%s $%04X", op_str, (fetch16 () + pc) & 0xffff);
       break;
 
     case _reg_post:
       op = fetch8 ();
-      sprintf (buf, "%s,%s", reg[op >> 4], reg[op & 15]);
+      sprintf (buf, "%s %s,%s", op_str, reg[op >> 4], reg[op & 15]);
       break;
 
     case _usr_post:
     case _sys_post:
       op = fetch8 ();
+      sprintf (buf, "%s ", op_str);
 
       if (op & 0x80)
 	strcat (buf, "PC,");
@@ -1098,30 +1161,13 @@ load_map_file (const char *name)
 	char *value_ptr, *id_ptr;
 	target_addr_t value;
 	char *file_ptr;
-	struct symbol *sym = NULL;
 
-	/* Try appending the suffix 'map' to the name of the program. */
 	sprintf (map_filename, "%s.map", name);
-	fp = file_open (NULL, map_filename, "r");
+
+	fp = fopen (map_filename, "r");
 	if (!fp)
-	{
-		/* If that fails, try replacing any existing suffix. */
-		sprintf (map_filename, "%s", name);
-		char *s = strrchr (map_filename, '.');
-		if (s)
-		{
-			sprintf (s+1, "map");
-			fp = file_open (NULL, map_filename, "r");
-		}
+		return -1;
 
-		if (!fp)
-		{
-			fprintf (stderr, "warning: no symbols for %s\n", name);
-			return -1;
-		}
-	}
-
-	printf ("Reading symbols from '%s'...\n", map_filename);
 	for (;;)
 	{
 		fgets (buf, sizeof(buf)-1, fp);
@@ -1129,15 +1175,6 @@ load_map_file (const char *name)
 			break;
 
 		value_ptr = buf;
-		if (!strncmp (value_ptr, "page", 4))
-		{
-			unsigned char page = strtoul (value_ptr+4, NULL, 10);
-			if (!strcmp (machine->name, "wpc"))
-				wpc_set_rom_page (page);
-			sym = NULL;
-			continue;
-		}
-
 		if (strncmp (value_ptr, "      ", 6))
 			continue;
 
@@ -1158,9 +1195,7 @@ load_map_file (const char *name)
 
 		file_ptr = strtok (NULL, " \t\n");
 
-		if (sym)
-			sym->ty.size = to_absolute (value) - sym->value;
-		sym = sym_add (&program_symtab, id_ptr, to_absolute (value), 0); /* file_ptr? */
+		add_named_symbol (id_ptr, value, file_ptr);
 	}
 
 	fclose (fp);
@@ -1169,14 +1204,14 @@ load_map_file (const char *name)
 
 
 int
-load_hex (const char *name)
+load_hex (char *name)
 {
   FILE *fp;
   int count, addr, type, data, checksum;
   int done = 1;
   int line = 0;
 
-  fp = file_open (NULL, name, "r");
+  fp = fopen (name, "r");
 
   if (fp == NULL)
     {
@@ -1238,18 +1273,18 @@ load_hex (const char *name)
 
 
 int
-load_s19 (const char *name)
+load_s19 (char *name)
 {
   FILE *fp;
   int count, addr, type, data, checksum;
   int done = 1;
   int line = 0;
 
-  fp = file_open (NULL, name, "r");
+  fp = fopen (name, "r");
 
   if (fp == NULL)
     {
-      printf ("failed to open S-record file %s.\n", name);
+      printf ("failed to open S record file %s.\n", name);
       return 1;
     }
 
@@ -1304,40 +1339,58 @@ load_s19 (const char *name)
   return 0;
 }
 
+int
+load_bin (char *name, int addr)
+{
+  FILE *fp;
+  int size;
+
+  fp = fopen (name, "rb");
+
+  if (fp == NULL)
+    {
+      printf ("failed to open binary file %s.\n", name);
+      return 1;
+    }
+
+  size = sizeof_file (fp);
+
+  if ((addr + size) > 0x10000)
+    {
+      printf ("file %s size problems\n", name);
+      fclose (fp);
+      return 1;
+    }
+
+  fread (memory + addr, size, 1, fp);
+
+  fclose (fp);
+  return 0;
+}
 
 
 void
 monitor_call (unsigned int flags)
 {
-#ifdef CALL_STACK
+	current_function_call++;
 	if (current_function_call <= &fctab[MAX_FUNCTION_CALLS-1])
 	{
-		current_function_call++;
 		current_function_call->entry_point = get_pc ();
 		current_function_call->flags = flags;
 	}
-#endif
-#if 0
-	const char *id = sym_lookup (&program_symtab, to_absolute (get_pc ()));
-	if (id)
-	{
-		// printf ("In %s now\n", id);
-	}
-#endif
 }
 
 
 void
 monitor_return (void)
 {
-#ifdef CALL_STACK
 	if (current_function_call > &fctab[MAX_FUNCTION_CALLS-1])
 	{
 		current_function_call--;
 		return;
 	}
 
-	while ((current_function_call->flags & FC_TAIL_CALL) &&
+	while ((current_function_call->flags & FC_TAIL_CALL) && 
 		(current_function_call > fctab))
 	{
 		current_function_call--;
@@ -1345,45 +1398,187 @@ monitor_return (void)
 
 	if (current_function_call > fctab)
 		current_function_call--;
-#endif
 }
 
 
 const char *
-absolute_addr_name (absolute_address_t addr)
+monitor_addr_name (target_addr_t addr)
 {
-	static char buf[256], *bufptr;
-	const char *name;
+	static char addr_name[256];
+	struct symbol *sym;
 
-	bufptr = buf;
-
-   bufptr += sprintf (bufptr, "%02X:0x%04X", addr >> 28, addr & 0xFFFFFF);
-
-   name = sym_lookup (&program_symtab, addr);
-   if (name)
-      bufptr += sprintf (bufptr, "  <%-16.16s>", name);
-
-	return buf;
-
+	sym = find_symbol (addr);
+	if (sym)
+	{
+		if (sym->u.named.addr == addr)
+			return sym->u.named.id;
+		else
+			sprintf (addr_name, "%s+0x%X", 
+				sym->u.named.id, addr - sym->u.named.addr);
+	}
+	else
+		sprintf (addr_name, "$%04X", addr);
+	return addr_name;
 }
 
 
-const char *
-monitor_addr_name (target_addr_t target_addr)
+#define CLEAR_BREAK		0xffffffff
+
+
+void
+str_toupper (char *str)
 {
-	static char buf[256], *bufptr;
-	const char *name;
-	absolute_address_t addr = to_absolute (target_addr);
+  if (*str == '\0' || str == NULL)
+    return;
+  do
+    {
+      *str = toupper (*str);
+      str++;
+    }
+  while (*str != '\0');
+}
 
-	bufptr = buf;
+int
+str_getnumber (char *str)
+{
+	struct symbol *sym = find_symbol_by_name (str);
+	if (sym)
+		return sym->u.named.addr;
 
-   bufptr += sprintf (bufptr, "0x%04X", target_addr);
+  return strtoul (str, NULL, 0);
+}
 
-   name = sym_lookup (&program_symtab, addr);
-   if (name)
-      bufptr += sprintf (bufptr, "  <%s>", name);
+int
+str_scan (char *str, char *table[], int maxi)
+{
+  int i = 0;
 
-	return buf;
+  for (;;)
+    {
+      while (isgraph (*str) == 0 && *str != '\0')
+	str++;
+      if (*str == '\0')
+	return i;
+      table[i] = str;
+      if (maxi-- == 0)
+	return i;
+
+      while (isgraph (*str) != 0)
+	str++;
+      if (*str == '\0')
+	return i;
+      *str++ = '\0';
+      i++;
+    }
+}
+
+typedef struct
+{
+  int cmd_nro;
+  char *cmd_string;
+} command_t;
+
+enum cmd_numbers
+{
+  CMD_HELP,
+  CMD_DUMP,
+  CMD_DASM,
+  CMD_RUN,
+  CMD_STEP,
+  CMD_CONTINUE,
+  CMD_SET,
+  CMD_CLR,
+  CMD_SHOW,
+  CMD_SETBRK,
+  CMD_CLRBRK,
+  CMD_BRKSHOW,
+  CMD_JUMP,
+  CMD_QUIT,
+  CMD_BACKTRACE,
+  CMD_NEXT,
+
+  REG_PC,
+  REG_X,
+  REG_Y,
+  REG_S,
+  REG_U,
+  REG_D,
+  REG_CC,
+  REG_DP,
+  REG_A,
+  REG_B,
+  CCR_E,
+  CCR_F,
+  CCR_H,
+  CCR_I,
+  CCR_N,
+  CCR_Z,
+  CCR_V,
+  CCR_C
+};
+
+command_t cmd_table[] = {
+  {CMD_HELP, "h"},
+  {CMD_DUMP, "dump"},
+  {CMD_DASM, "dasm"},
+  {CMD_RUN, "r"},
+  {CMD_JUMP, "jump"},
+  {CMD_SET, "set"},
+  {CMD_CLR, "clear"},
+  {CMD_SHOW, "show"},
+  {CMD_SETBRK, "b"},
+  {CMD_CLRBRK, "bc"},
+  {CMD_BRKSHOW, "bl"},
+  {CMD_QUIT, "q"},
+  {CMD_CONTINUE, "c"},
+  {CMD_STEP, "s"},
+  {CMD_NEXT, "n"},
+  {CMD_BACKTRACE, "bt" },
+  {-1, NULL}
+};
+
+command_t arg_table[] = {
+  {REG_PC, "PC"},
+  {REG_X, "X"},
+  {REG_Y, "Y"},
+  {REG_S, "S"},
+  {REG_U, "U"},
+  {REG_D, "D"},
+  {REG_CC, "CC"},
+  {REG_DP, "DP"},
+  {REG_A, "A"},
+  {REG_B, "B"},
+  {CCR_E, "E"},
+  {CCR_F, "F"},
+  {CCR_H, "H"},
+  {CCR_I, "I"},
+  {CCR_N, "N"},
+  {CCR_Z, "Z"},
+  {CCR_V, "V"},
+  {CCR_C, "C"},
+
+  {-1, NULL}
+};
+
+int
+get_command (char *str, command_t * table)
+{
+  int index;
+  int nro = -1;
+
+  if (*str == '\0' || str == NULL)
+    return -1;
+
+  for (index = 0; table[index].cmd_string != NULL; index++)
+    {
+      if (strcmp (str, table[index].cmd_string) == 0)
+	{
+	  nro = table[index].cmd_nro;
+	  break;
+	}
+    }
+
+  return nro;
 }
 
 
@@ -1391,7 +1586,6 @@ static void
 monitor_signal (int sigtype)
 {
   (void) sigtype;
-  putchar ('\n');
   monitor_on = 1;
 }
 
@@ -1402,27 +1596,215 @@ monitor_init (void)
 	int tmp;
 	extern int debug_enabled;
 	target_addr_t a;
+	int bp;
+
+	symtab.name_area = symtab.name_area_next = 
+		malloc (symtab.name_area_free = 0x100000);
+	a = 0; 
+	do {
+		symtab.addr_to_symbol[a] = NULL;
+	} while (++a != 0);
+
+	for (bp = 0; bp < MAX_BREAKPOINTS; bp++) {
+		bptab[bp].flags = BP_FREE;
+	}
 
 	fctab[0].entry_point = read16 (0xfffe);
 	memset (&fctab[0].entry_regs, 0, sizeof (struct cpu_regs));
 	current_function_call = &fctab[0];
 
-  auto_break_insn_count = 0;
+	prompt_flags = PROMPT_REGS | PROMPT_INSN;
+
+  auto_break_insn_count = do_break = 0;
   monitor_on = debug_enabled;
   signal (SIGINT, monitor_signal);
 }
 
-
 int
-check_break (void)
+check_break (unsigned break_pc)
 {
-	if (dump_every_insn)
-		print_current_insn ();
+  int temp_pc = break_pc & 0xffff;
 
-	if (auto_break_insn_count > 0)
-		if (--auto_break_insn_count == 0)
-			return 1;
-	return 0;
+  if (do_break != 0)
+    {
+      int tmp;
+
+      for (tmp = 0; tmp < MAX_BREAKPOINTS; tmp++)
+	{
+	if ((bptab[tmp].flags & BP_USED) && (bptab[tmp].addr == temp_pc))
+		{
+		printf ("Breakpoint %d at %s reached\n", tmp, monitor_addr_name (temp_pc));
+	    	return 1;
+		}
+	}
+    }
+
+  if (auto_break_insn_count > 0)
+    if (--auto_break_insn_count == 0)
+      return 1;
+
+  return 0;
+}
+
+void
+add_breakpoint (int break_pc)
+{
+  int tmp;
+  int clear = -1;
+
+  for (tmp = 0; tmp < MAX_BREAKPOINTS; tmp++)
+    {
+      if (bptab[tmp].addr == break_pc)
+	break;
+      else if ((bptab[tmp].flags & BP_USED) == 0)
+	{
+	  clear = tmp;
+	  break;
+	}
+    }
+
+  if (clear == -1)
+    {
+      printf ("failed to add breakpoint\n");
+      return;
+    }
+
+  bptab[clear].count = 1;
+  bptab[clear].flags = BP_USED;
+  bptab[clear].addr = break_pc;
+  do_break++;
+  printf ("Breakpoint %d set at %s\n", clear, monitor_addr_name (break_pc));
+}
+
+void
+clear_breakpoint (int break_pc)
+{
+  int tmp;
+
+  for (tmp = 0; tmp < MAX_BREAKPOINTS; tmp++)
+    {
+      if (bptab[tmp].addr == break_pc)
+	{
+	  bptab[tmp].addr = 0; /* invalid address */
+	  bptab[tmp].flags = BP_FREE;
+	  do_break--;
+	}
+    }
+}
+
+
+void
+show_breakpoints (void)
+{
+  int tmp;
+
+  for (tmp = 0; tmp < MAX_BREAKPOINTS; tmp++)
+    {
+      if (bptab[tmp].flags & BP_USED) 
+	printf ("%d : %s\n", tmp, monitor_addr_name (bptab[tmp].addr));
+    }
+}
+
+void
+cmd_dump (int start, int end)
+{
+  int addr = start;
+  int lsize;
+  char abuf[17];
+
+  if (start >= end)
+    {
+      printf ("invalid arguments\n");
+      return;
+    }
+
+  printf ("memory dump $%04x to $%04x\n", start, end);
+
+  for (;;)
+    {
+      printf ("%04x: ", addr);
+
+      for (lsize = 0; (addr < (end + 1)) && (lsize < 16); addr++, lsize++)
+	{
+	  int mb = read8 (addr);
+	  printf ("%02x ", mb);
+	  abuf[lsize] = isprint (mb) ? mb : '.';
+	}
+      abuf[lsize] = '\0';
+      while (lsize++ < 16)
+	printf ("   ");
+
+      puts (abuf);
+
+      if (addr > end)
+	break;
+    }
+
+}
+
+void
+cmd_dasm (int start, int end)
+{
+  char buf[50];
+  int addr = start;
+  int size;
+
+  if (start >= end)
+    {
+      printf ("invalid arguments\n");
+      return;
+    }
+
+  do
+    {
+      size = dasm (buf, addr);
+      printf ("%04x: %-15s ;", addr, buf);
+
+      for (; size; size--)
+	      printf ("%02x ", read8 (addr++));
+      printf ("\n");
+    }
+  while (addr < (end + 1));
+}
+
+void
+cmd_show (void)
+{
+  int cc = get_cc ();
+  int pc = get_pc ();
+  char inst[50];
+  int offset, moffset;
+  extern int total;
+
+  moffset = dasm (inst, pc);
+
+  printf ("S  $%04X U  $%04X X  $%04X Y  $%04X   EFHINZVC\n", get_s (),
+	  get_u (), get_x (), get_y ());
+  printf ("A  $%02X   B  $%02X   DP $%02X   CC $%02X     ", get_a (),
+	  get_b (), get_dp (), cc);
+  printf ("%c%c%c%c", (cc & E_FLAG ? '1' : '.'), (cc & F_FLAG ? '1' : '.'),
+	  (cc & H_FLAG ? '1' : '.'), (cc & I_FLAG ? '1' : '.'));
+  printf ("%c%c%c%c\n", (cc & N_FLAG ? '1' : '.'), (cc & Z_FLAG ? '1' : '.'),
+	  (cc & V_FLAG ? '1' : '.'), (cc & C_FLAG ? '1' : '.'));
+  printf ("PC: %s  ", monitor_addr_name (pc));
+  printf ("Cycle  %lX   ", total);
+  for (offset = 0; offset < moffset; offset++)
+    printf ("%02X", read8 (offset+pc));
+  printf ("  NextInst: %s\n", inst);
+}
+
+
+void
+monitor_prompt (void)
+{
+	char inst[50];
+	target_addr_t pc = get_pc ();
+	dasm (inst, pc);
+
+	printf ("      S:%04X U:%04X X:%04X Y:%04X D:%04X\n", 
+		get_s (), get_u (), get_x (), get_y (), get_d ());
+
+	printf ("%30.30s   %s\n", monitor_addr_name (pc), inst);
 }
 
 
@@ -1439,10 +1821,327 @@ monitor_backtrace (void)
 int
 monitor6809 (void)
 {
-	int rc;
+  char cmd_str[50];
+  char *arg[10];
+  int arg_count;
 
-	signal (SIGINT, monitor_signal);
-	rc = command_loop ();
-	monitor_on = 0;
-	return rc;
+  signal (SIGINT, monitor_signal);
+  monitor_on = 0;
+
+  /* cmd_show (); */
+  monitor_prompt ();
+
+  for (;;)
+    {
+
+      printf ("(m6809-run) ");
+      fflush (stdout);
+      fflush (stdin);
+
+      fgets (cmd_str, sizeof (cmd_str), stdin);
+
+      arg_count = str_scan (cmd_str, arg, 5);
+
+      if (arg_count == 0)
+	{
+	  auto_break_insn_count = 1;
+	  return 0;
+	}
+
+      switch (get_command (arg[0], cmd_table))
+	{
+	case CMD_NEXT:
+	case CMD_STEP:
+	  auto_break_insn_count = 1;
+	  return 0;
+
+	case CMD_HELP:
+	  puts ("\n6809 monitor commands:                         ");
+	  puts ("HELP                  - shows this text          ");
+	  puts ("DUMP   start end      - dump memory start to end ");
+	  puts ("DASM   start end      - disassemble start to end ");
+	  puts ("RUN    n              - run n instructions       ");
+	  puts ("GO     addr           - start executing at addr  ");
+	  puts ("SET    register value - put value to register    ");
+	  puts ("SET    flag           - set CC flag              ");
+	  puts ("CLR    register       - clear register           ");
+	  puts ("CLR    flag           - clear CC flag            ");
+	  puts ("SHOW   register       - show register hex value  ");
+	  puts ("SHOW   flag           - show CC flag             ");
+	  puts ("SETBRK addr           - set breakpoint to addr   ");
+	  puts ("CLRBRK addr           - clear breakpoint at addr ");
+	  puts ("bl                    - list breakpoints         ");
+	  puts ("boff                  - disable all breakpoints  ");
+	  puts ("bon                   - enable all breakpoints   ");
+	  puts ("q                     - quit simulator           ");
+	  puts ("g                     - go!                      ");
+	  puts ("number formats $hex, @oct, %bin, dec           \n");
+	  continue;
+
+	case CMD_BACKTRACE:
+		monitor_backtrace ();
+		continue;
+
+	case CMD_DUMP:
+	  if (arg_count != 3)
+	    break;
+	  cmd_dump (str_getnumber (arg[1]) & 0xffff,
+		    str_getnumber (arg[2]) & 0xffff);
+	  continue;
+
+	case CMD_DASM:
+	  if (arg_count != 3)
+	    break;
+	  cmd_dasm (str_getnumber (arg[1]) & 0xffff,
+		    str_getnumber (arg[2]) & 0xffff);
+	  continue;
+
+	case CMD_RUN:
+	  if (arg_count != 2)
+	    break;
+	  auto_break_insn_count = str_getnumber (arg[1]) & 0xffff;
+	  if (auto_break_insn_count != 0)
+	    return 0;
+	  break;
+
+	case CMD_JUMP:
+	  if (arg_count != 2)
+	    break;
+	  set_pc (str_getnumber (arg[1]) & 0xffff);
+	  return 0;
+
+	case CMD_SET:
+	  if (arg_count == 3)
+	    {
+	      int temp = str_getnumber (arg[2]);
+
+	      switch (get_command (arg[1], arg_table))
+		{
+		case REG_PC:
+		  set_pc (temp);
+		  continue;
+		case REG_X:
+		  set_x (temp);
+		  continue;
+		case REG_Y:
+		  set_y (temp);
+		  continue;
+		case REG_S:
+		  set_s (temp);
+		  continue;
+		case REG_U:
+		  set_u (temp);
+		  continue;
+		case REG_D:
+		  set_d (temp);
+		  continue;
+		case REG_CC:
+		  set_cc (temp);
+		  continue;
+		case REG_DP:
+		  set_dp (temp);
+		  continue;
+		case REG_A:
+		  set_a (temp);
+		  continue;
+		case REG_B:
+		  set_b (temp);
+		  continue;
+		}
+	      break;		/* invalid argument */
+	    }
+	  else if (arg_count == 2)
+	    {
+	      switch (get_command (arg[1], arg_table))
+		{
+		case CCR_E:
+		  set_cc (get_cc () | E_FLAG);
+		  continue;
+		case CCR_F:
+		  set_cc (get_cc () | F_FLAG);
+		  continue;
+		case CCR_H:
+		  set_cc (get_cc () | H_FLAG);
+		  continue;
+		case CCR_I:
+		  set_cc (get_cc () | I_FLAG);
+		  continue;
+		case CCR_N:
+		  set_cc (get_cc () | N_FLAG);
+		  continue;
+		case CCR_Z:
+		  set_cc (get_cc () | Z_FLAG);
+		  continue;
+		case CCR_V:
+		  set_cc (get_cc () | V_FLAG);
+		  continue;
+		case CCR_C:
+		  set_cc (get_cc () | C_FLAG);
+		  continue;
+		}
+	      break;		/* invalid argument */
+	    }
+	  break;		/* invalid number of arguments */
+
+	case CMD_CLR:
+	  if (arg_count != 2)
+	    break;
+
+	  switch (get_command (arg[1], arg_table))
+	    {
+	    case REG_PC:
+	      set_pc (0);
+	      continue;
+	    case REG_X:
+	      set_x (0);
+	      continue;
+	    case REG_Y:
+	      set_y (0);
+	      continue;
+	    case REG_S:
+	      set_s (0);
+	      continue;
+	    case REG_U:
+	      set_u (0);
+	      continue;
+	    case REG_D:
+	      set_d (0);
+	      continue;
+	    case REG_DP:
+	      set_dp (0);
+	      continue;
+	    case REG_CC:
+	      set_cc (0);
+	      continue;
+	    case REG_A:
+	      set_a (0);
+	      continue;
+	    case REG_B:
+	      set_b (0);
+	      continue;
+
+	    case CCR_E:
+	      set_cc (get_cc () & ~E_FLAG);
+	      continue;
+	    case CCR_F:
+	      set_cc (get_cc () & ~F_FLAG);
+	      continue;
+	    case CCR_H:
+	      set_cc (get_cc () & ~H_FLAG);
+	      continue;
+	    case CCR_I:
+	      set_cc (get_cc () & ~I_FLAG);
+	      continue;
+	    case CCR_N:
+	      set_cc (get_cc () & ~N_FLAG);
+	      continue;
+	    case CCR_Z:
+	      set_cc (get_cc () & ~Z_FLAG);
+	      continue;
+	    case CCR_V:
+	      set_cc (get_cc () & ~V_FLAG);
+	      continue;
+	    case CCR_C:
+	      set_cc (get_cc () & ~C_FLAG);
+	      continue;
+	    }
+	  break;		/* invalid argument */
+
+	case CMD_SHOW:
+	  if (arg_count != 2)
+	    {
+	      cmd_show ();
+	      continue;
+	    }
+
+	  switch (get_command (arg[1], arg_table))
+	    {
+	    case REG_PC:
+	      printf ("PC: %s\n", monitor_addr_name (get_pc ()));
+	      continue;
+	    case REG_X:
+	      printf ("X:  $%04X\n", get_x ());
+	      continue;
+	    case REG_Y:
+	      printf ("Y:  $%04X\n", get_y ());
+	      continue;
+	    case REG_S:
+	      printf ("S:  $%04X\n", get_s ());
+	      continue;
+	    case REG_U:
+	      printf ("U:  $%04X\n", get_u ());
+	      continue;
+	    case REG_D:
+	      printf ("D:  $%04X\n", get_d ());
+	      continue;
+	    case REG_DP:
+	      printf ("DP: $%02X\n", get_dp ());
+	      continue;
+	    case REG_CC:
+	      printf ("CC: $%02X\n", get_cc ());
+	      continue;
+	    case REG_A:
+	      printf ("A:  $%02X\n", get_a ());
+	      continue;
+	    case REG_B:
+	      printf ("B:  $%02X\n", get_b ());
+	      continue;
+
+	    case CCR_E:
+	      printf ("CC:E %c\n", get_cc () & E_FLAG ? '1' : '0');
+	      continue;
+	    case CCR_F:
+	      printf ("CC:F %c\n", get_cc () & F_FLAG ? '1' : '0');
+	      continue;
+	    case CCR_H:
+	      printf ("CC:H %c\n", get_cc () & H_FLAG ? '1' : '0');
+	      continue;
+	    case CCR_I:
+	      printf ("CC:I %c\n", get_cc () & I_FLAG ? '1' : '0');
+	      continue;
+	    case CCR_N:
+	      printf ("CC:N %c\n", get_cc () & N_FLAG ? '1' : '0');
+	      continue;
+
+	    case CCR_Z:
+	      printf ("CC:Z %c\n", get_cc () & Z_FLAG ? '1' : '0');
+	      continue;
+	    case CCR_V:
+	      printf ("CC:V %c\n", get_cc () & V_FLAG ? '1' : '0');
+	      continue;
+	    case CCR_C:
+	      printf ("CC:C %c\n", get_cc () & C_FLAG ? '1' : '0');
+	      continue;
+	    }
+	  break;		/* invalid argument */
+
+	case CMD_SETBRK:
+	  if (arg_count != 2)
+	    break;
+	  add_breakpoint (str_getnumber (arg[1]) & 0xffff);
+	  continue;
+
+	case CMD_CLRBRK:
+	  if (arg_count != 2)
+	    break;
+	  clear_breakpoint (str_getnumber (arg[1]) & 0xffff);
+	  continue;
+
+	case CMD_BRKSHOW:
+	  show_breakpoints ();
+	  continue;
+
+	case CMD_QUIT:
+	  cpu_quit = 0;
+	  return 1;
+	case CMD_CONTINUE:
+	  return 0;
+	default:
+	case -1:
+	  puts ("invalid command");
+	  continue;
+	}
+
+      puts ("invalid argument or number of arguments");
+    }
 }

@@ -8,12 +8,12 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- *
+ * 
  * GCC6809 is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
+ * 
  * You should have received a copy of the GNU General Public License
  * along with GCC6809; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
@@ -25,11 +25,24 @@
 #include "monitor.h"
 #include <stdarg.h>
 
+#define STACK_MIN 0x1800
+#define STACK_MAX 0x2000
+#define CODE_MIN 0x8000
+#define CODE_MAX 0xFEFF
+#define IO_MIN 0xFF00
+#define IO_MAX 0xFF7F
+
+#define ADDR_RANGE_P(a,min,max)   (((a) >= (min)) && ((a) <= (max)))
+#define STACK_ADDR_P(a)           ADDR_RANGE_P (a, STACK_MIN, STACK_MAX)
+#define CODE_ADDR_P(a)            ADDR_RANGE_P (a, CODE_MIN, CODE_MAX)
+#define IO_ADDR_P(a)              ADDR_RANGE_P (a, IO_MIN, IO_MAX)
+
+#define WRITABLE_P(a)             (!CODE_ADDR_P (a))
+
 unsigned X, Y, S, U, PC;
 unsigned A, B, DP;
-unsigned H, N, Z, OV, C;
+unsigned H, N, Z, V, C;
 unsigned EFI;
-
 #ifdef H6309
 unsigned E, F, V, MD;
 
@@ -37,18 +50,23 @@ unsigned E, F, V, MD;
 #define MD_FIRQ_LIKE_IRQ 0x2	/* if 1, FIRQ acts like IRQ */
 #define MD_ILL 0x40		/* illegal instruction */
 #define MD_DBZ 0x80		/* divide by zero */
-#endif /* H6309 */
+#endif
 
 unsigned iPC;
 
-unsigned long irq_start_time;
+#ifdef CONFIG_WPC
+/** Pointers to each 16KB portion of the 6809 address space,
+ * which may change due to bank registers */
+UINT8 *regions[4] = { NULL, NULL, NULL, NULL };
+#endif
+
+/** A pointer to the flat address space */
+UINT8 *memory = NULL;
+
 unsigned ea = 0;
-long cpu_clk = 0;
-long cpu_period = 0;
+int cpu_clk = 0;
+int cpu_period = 0;
 int cpu_quit = 1;
-unsigned int irqs_pending = 0;
-unsigned int firqs_pending = 0;
-unsigned int cc_changed = 0;
 
 unsigned *index_regs[4] = { &X, &Y, &U, &S };
 
@@ -56,56 +74,27 @@ extern int dump_cycles_on_success;
 
 extern int trace_enabled;
 
-extern void irq (void);
-extern void firq (void);
-
-
-void request_irq (unsigned int source)
-{
-	/* If the interrupt is not masked, generate
-	 * IRQ immediately.  Else, mark it pending and
-	 * we'll check it later when the flags change.
-	 */
-	irqs_pending |= (1 << source);
-	if (!(EFI & I_FLAG))
-		irq ();
-}
-
-void release_irq (unsigned int source)
-{
-	irqs_pending &= ~(1 << source);
-}
-
-
-void request_firq (unsigned int source)
-{
-	/* If the interrupt is not masked, generate
-	 * IRQ immediately.  Else, mark it pending and
-	 * we'll check it later when the flags change.
-	 */
-	firqs_pending |= (1 << source);
-	if (!(EFI & F_FLAG))
-		firq ();
-}
-
-void release_firq (unsigned int source)
-{
-	firqs_pending &= ~(1 << source);
-}
-
-
 
 static inline void
 check_pc (void)
 {
-	/* TODO */
+  if (!CODE_ADDR_P (PC) && !STACK_ADDR_P (PC))
+    {
+      fprintf (stderr, "m6809-run: invalid PC = %04X\n", PC);
+      exit (2);
+    }
 }
 
 
 static inline void
 check_stack (void)
 {
-	/* TODO */
+	if (!STACK_ADDR_P (S))
+    {
+      fprintf (stderr, "m6809-run: invalid stack pointer = %04X\n", S);
+      exit (2);
+    }
+
 }
 
 
@@ -115,7 +104,7 @@ sim_error (const char *format, ...)
 	va_list ap;
 
 	va_start (ap, format);
-	fprintf (stderr, "m6809-run: (at PC=%04X) ", iPC);
+	fprintf (stderr, "m6809-run: (at PC=%04X) ", PC);
 	vfprintf (stderr, format, ap);
 	va_end (ap);
 
@@ -126,17 +115,9 @@ sim_error (const char *format, ...)
 }
 
 
-unsigned long
-get_cycles (void)
-{
-	return total + cpu_period - cpu_clk;
-}
-
-
 void
 sim_exit (uint8_t exit_code)
 {
-	char *s;
 
 	/* On a nonzero exit, always print an error message. */
 	if (exit_code != 0)
@@ -148,21 +129,7 @@ sim_exit (uint8_t exit_code)
 
 	/* If a cycle count should be printed, do that last. */
 	if (dump_cycles_on_success)
-	{
-		printf ("%s : %ld cycles, %ld ms\n", prog_name, get_cycles (),
-			get_elapsed_realtime ());
-	}
-
-	if ((s = getenv ("LOG6809")) != NULL)
-	{
-		FILE *fp = fopen (s, "a");
-		if (fp)
-		{
-			fprintf (fp, "%s : %ld cycles, %ld ms\n", prog_name, get_cycles (),
-				get_elapsed_realtime ());
-			fclose (fp);
-		}
-	}
+		printf ("Finished in %d cycles\n", total + cpu_period - cpu_clk);
 
 	exit (exit_code);
 }
@@ -171,7 +138,6 @@ sim_exit (uint8_t exit_code)
 static inline void
 change_pc (unsigned newPC)
 {
-#if 0
   /* TODO - will let some RAM execute for trampolines */
   if ((newPC < 0x1C00) || (newPC > 0xFFFF))
   {
@@ -185,7 +151,6 @@ change_pc (unsigned newPC)
 		fprintf (stderr, "PC : %s ", monitor_addr_name (PC));
 		fprintf (stderr, "-> %s\n", monitor_addr_name (newPC));
 	}
-#endif
   PC = newPC;
 }
 
@@ -206,7 +171,16 @@ imm_word (void)
   return val;
 }
 
-#define WRMEM(addr, data) write8 (addr, data)
+static inline void
+WRMEM (unsigned addr, unsigned data)
+{
+	if (!WRITABLE_P (addr))
+		sim_error ("write to read-only location %04X from %s\n", 
+			addr, monitor_addr_name (PC));
+
+	if (!IO_ADDR_P (addr) || TARGET_MACHINE.write_byte (addr, data))
+      write8 (addr, (UINT8) data);
+}
 
 static void
 WRMEM16 (unsigned addr, unsigned data)
@@ -216,7 +190,14 @@ WRMEM16 (unsigned addr, unsigned data)
   WRMEM ((addr + 1) & 0xffff, data & 0xff);
 }
 
-#define RDMEM(addr) read8 (addr)
+static inline unsigned
+RDMEM (unsigned addr)
+{
+	uint8_t data;
+	if (!IO_ADDR_P (addr) || TARGET_MACHINE.read_byte (addr, &data))
+		data = read8 (addr);
+	return data;
+}
 
 static unsigned
 RDMEM16 (unsigned addr)
@@ -388,7 +369,15 @@ indexed (void)			/* note take 1 extra cycle */
 	  break;
 	default:
 	  ea = 0;
-	  sim_error ("invalid index post $%02X\n", post);
+	  printf ("%X: invalid index post $%02X\n", iPC, post);
+	  if (debug_enabled)
+	    {
+	      monitor_on = 1;
+	    }
+	  else
+	    {
+	      exit (1);
+	    }
 	  break;
 	}
     }
@@ -465,12 +454,6 @@ unsigned
 get_d (void)
 {
   return (A << 8) | B;
-}
-
-unsigned
-get_flags (void)
-{
-  return EFI;
 }
 
 #ifdef H6309
@@ -632,7 +615,7 @@ get_cc (void)
     res |= N_FLAG;
   if (Z == 0)
     res |= Z_FLAG;
-  if (OV & 0x80)
+  if (V & 0x80)
     res |= V_FLAG;
   if (C != 0)
     res |= C_FLAG;
@@ -647,21 +630,8 @@ set_cc (unsigned arg)
   H = (arg & H_FLAG ? 0x10 : 0);
   N = (arg & N_FLAG ? 0x80 : 0);
   Z = (~arg) & Z_FLAG;
-  OV = (arg & V_FLAG ? 0x80 : 0);
+  V = (arg & V_FLAG ? 0x80 : 0);
   C = arg & C_FLAG;
-  cc_changed = 1;
-}
-
-
-void
-cc_modified (void)
-{
-  /* Check for pending interrupts */
-	if (firqs_pending && !(EFI & F_FLAG))
-		firq ();
-	else if (irqs_pending && !(EFI & I_FLAG))
-		irq ();
-	cc_changed = 0;
 }
 
 unsigned
@@ -788,7 +758,7 @@ adc (unsigned arg, unsigned val)
 
   C = (res >> 1) & 0x80;
   N = Z = res &= 0xff;
-  OV = H = arg ^ val ^ res ^ C;
+  V = H = arg ^ val ^ res ^ C;
 
   return res;
 }
@@ -800,7 +770,7 @@ add (unsigned arg, unsigned val)
 
   C = (res >> 1) & 0x80;
   N = Z = res &= 0xff;
-  OV = H = arg ^ val ^ res ^ C;
+  V = H = arg ^ val ^ res ^ C;
 
   return res;
 }
@@ -811,7 +781,7 @@ and (unsigned arg, unsigned val)
   unsigned res = arg & val;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
 
   return res;
 }
@@ -823,7 +793,7 @@ asl (unsigned arg)		/* same as lsl */
 
   C = res & 0x100;
   N = Z = res &= 0xff;
-  OV = arg ^ res;
+  V = arg ^ res;
   cpu_clk -= 2;
 
   return res;
@@ -847,13 +817,13 @@ bit (unsigned arg, unsigned val)
   unsigned res = arg & val;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
 }
 
 static unsigned
 clr (unsigned arg)
 {
-  C = N = Z = OV = arg = 0;
+  C = N = Z = V = arg = 0;
   cpu_clk -= 2;
 
   return arg;
@@ -866,7 +836,7 @@ cmp (unsigned arg, unsigned val)
 
   C = res & 0x100;
   N = Z = res &= 0xff;
-  OV = (arg ^ val) & (arg ^ res);
+  V = (arg ^ val) & (arg ^ res);
 }
 
 static unsigned
@@ -875,7 +845,7 @@ com (unsigned arg)
   unsigned res = arg ^ 0xff;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
   C = 1;
   cpu_clk -= 2;
 
@@ -898,7 +868,7 @@ daa (void)
 
   C |= (res & 0x100);
   A = N = Z = res &= 0xff;
-  OV = 0;			/* fix this */
+  V = 0;			/* fix this */
 
   cpu_clk -= 2;
 }
@@ -909,7 +879,7 @@ dec (unsigned arg)
   unsigned res = (arg - 1) & 0xff;
 
   N = Z = res;
-  OV = arg & ~res;
+  V = arg & ~res;
   cpu_clk -= 2;
 
   return res;
@@ -921,7 +891,7 @@ eor (unsigned arg, unsigned val)
   unsigned res = arg ^ val;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
 
   return res;
 }
@@ -951,7 +921,7 @@ inc (unsigned arg)
   unsigned res = (arg + 1) & 0xff;
 
   N = Z = res;
-  OV = ~arg & res;
+  V = ~arg & res;
   cpu_clk -= 2;
 
   return res;
@@ -963,7 +933,7 @@ ld (unsigned arg)
   unsigned res = arg;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
 
   return res;
 }
@@ -999,7 +969,7 @@ neg (int arg)
   unsigned res = (-arg) & 0xff;
 
   C = N = Z = res;
-  OV = res & arg;
+  V = res & arg;
   cpu_clk -= 2;
 
   return res;
@@ -1011,7 +981,7 @@ or (unsigned arg, unsigned val)
   unsigned res = arg | val;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
 
   return res;
 }
@@ -1023,7 +993,7 @@ rol (unsigned arg)
 
   C = res & 0x100;
   N = Z = res &= 0xff;
-  OV = arg ^ res;
+  V = arg ^ res;
   cpu_clk -= 2;
 
   return res;
@@ -1050,7 +1020,7 @@ sbc (unsigned arg, unsigned val)
 
   C = res & 0x100;
   N = Z = res &= 0xff;
-  OV = (arg ^ val) & (arg ^ res);
+  V = (arg ^ val) & (arg ^ res);
 
   return res;
 }
@@ -1061,7 +1031,7 @@ st (unsigned arg)
   unsigned res = arg;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
 
   WRMEM (ea, res);
 }
@@ -1073,7 +1043,7 @@ sub (unsigned arg, unsigned val)
 
   C = res & 0x100;
   N = Z = res &= 0xff;
-  OV = (arg ^ val) & (arg ^ res);
+  V = (arg ^ val) & (arg ^ res);
 
   return res;
 }
@@ -1084,7 +1054,7 @@ tst (unsigned arg)
   unsigned res = arg;
 
   N = Z = res;
-  OV = 0;
+  V = 0;
   cpu_clk -= 2;
 }
 
@@ -1120,7 +1090,7 @@ addd (unsigned val)
 
   C = res & 0x10000;
   Z = res &= 0xffff;
-  OV = ((arg ^ res) & (val ^ res)) >> 8;
+  V = ((arg ^ res) & (val ^ res)) >> 8;
   A = N = res >> 8;
   B = res & 0xff;
 }
@@ -1133,7 +1103,7 @@ cmp16 (unsigned arg, unsigned val)
   C = res & 0x10000;
   Z = res &= 0xffff;
   N = res >> 8;
-  OV = ((arg ^ val) & (arg ^ res)) >> 8;
+  V = ((arg ^ val) & (arg ^ res)) >> 8;
 }
 
 static void
@@ -1144,7 +1114,7 @@ ldd (unsigned arg)
   Z = res;
   A = N = res >> 8;
   B = res & 0xff;
-  OV = 0;
+  V = 0;
 }
 
 static unsigned
@@ -1154,7 +1124,7 @@ ld16 (unsigned arg)
 
   Z = res;
   N = res >> 8;
-  OV = 0;
+  V = 0;
 
   return res;
 }
@@ -1179,7 +1149,7 @@ std (void)
 
   Z = res;
   N = A;
-  OV = 0;
+  V = 0;
   WRMEM16 (ea, res);
 }
 
@@ -1190,7 +1160,7 @@ st16 (unsigned arg)
 
   Z = res;
   N = res >> 8;
-  OV = 0;
+  V = 0;
   WRMEM16 (ea, res);
 }
 
@@ -1202,7 +1172,7 @@ subd (unsigned val)
 
   C = res & 0x10000;
   Z = res &= 0xffff;
-  OV = ((arg ^ val) & (arg ^ res)) >> 8;
+  V = ((arg ^ val) & (arg ^ res)) >> 8;
   A = N = res >> 8;
   B = res & 0xff;
 }
@@ -1463,7 +1433,6 @@ rti (void)
 {
   monitor_return ();
   cpu_clk -= 6;
-  command_exit_irq_hook (get_cycles () - irq_start_time);
   set_cc (read_stack (S));
   S = (S + 1) & 0xffff;
 
@@ -1518,32 +1487,10 @@ irq (void)
   write_stack (S, A);
   S = (S - 1) & 0xffff;
   write_stack (S, get_cc ());
-  EFI |= I_FLAG;
-
-  irq_start_time = get_cycles ();
-  change_pc (read16 (0xfff8));
-#if 1
-  irqs_pending = 0;
-#endif
-}
-
-
-void
-firq (void)
-{
-  EFI &= ~E_FLAG;
-  S = (S - 2) & 0xffff;
-  write_stack16 (S, PC & 0xffff);
-  S = (S - 1) & 0xffff;
-  write_stack (S, get_cc ());
   EFI |= (I_FLAG | F_FLAG);
 
-  change_pc (read16 (0xfff6));
-#if 1
-  firqs_pending = 0;
-#endif
+  change_pc (read16 (0xfff8));
 }
-
 
 void
 swi (void)
@@ -1621,44 +1568,19 @@ swi3 (void)
   change_pc (read16 (0xfff2));
 }
 
-#ifdef H6309
-void
-trap (void)
-{
-  cpu_clk -= 20;
-  EFI |= E_FLAG;
-  S = (S - 2) & 0xffff;
-  write_stack16 (S, PC & 0xffff);
-  S = (S - 2) & 0xffff;
-  write_stack16 (S, U);
-  S = (S - 2) & 0xffff;
-  write_stack16 (S, Y);
-  S = (S - 2) & 0xffff;
-  write_stack16 (S, X);
-  S = (S - 1) & 0xffff;
-  write_stack (S, DP >> 8);
-  S = (S - 1) & 0xffff;
-  write_stack (S, B);
-  S = (S - 1) & 0xffff;
-  write_stack (S, A);
-  S = (S - 1) & 0xffff;
-  write_stack (S, get_cc ());
-
-  change_pc (read16 (0xfff0));
-}
-#endif
-
 void
 cwai (void)
 {
-  sim_error ("CWAI - not supported yet!");
+  puts ("CWAI - not suported yet!");
+  exit (100);
 }
 
 void
 sync (void)
 {
+  puts ("SYNC - not suported yet!");
+  exit (100);
   cpu_clk -= 4;
-  sim_error ("SYNC - not supported yet!");
 }
 
 static void
@@ -1687,20 +1609,20 @@ andcc (void)
 #define cond_LO() (C != 0)
 #define cond_NE() (Z != 0)
 #define cond_EQ() (Z == 0)
-#define cond_VC() ((OV & 0x80) == 0)
-#define cond_VS() ((OV & 0x80) != 0)
+#define cond_VC() ((V & 0x80) == 0)
+#define cond_VS() ((V & 0x80) != 0)
 #define cond_PL() ((N & 0x80) == 0)
 #define cond_MI() ((N & 0x80) != 0)
-#define cond_GE() (((N^OV) & 0x80) == 0)
-#define cond_LT() (((N^OV) & 0x80) != 0)
-#define cond_GT() ((((N^OV) & 0x80) == 0) && (Z != 0))
-#define cond_LE() ((((N^OV) & 0x80) != 0) || (Z == 0))
+#define cond_GE() (((N^V) & 0x80) == 0)
+#define cond_LT() (((N^V) & 0x80) != 0)
+#define cond_GT() ((((N^V) & 0x80) == 0) && (Z != 0))
+#define cond_LE() ((((N^V) & 0x80) != 0) || (Z == 0))
 
 static void
 bra (void)
 {
   INT8 tmp = (INT8) imm_byte ();
-  change_pc (PC + tmp);
+  PC += tmp;
 }
 
 static void
@@ -1709,7 +1631,7 @@ branch (unsigned cond)
   if (cond)
     bra ();
   else
-    change_pc (PC+1);
+    PC++;
 
   cpu_clk -= 3;
 }
@@ -1718,7 +1640,7 @@ static void
 long_bra (void)
 {
   INT16 tmp = (INT16) imm_word ();
-  change_pc (PC + tmp);
+  PC += tmp;
 }
 
 static void
@@ -1731,7 +1653,7 @@ long_branch (unsigned cond)
     }
   else
     {
-      change_pc (PC + 2);
+      PC += 2;
       cpu_clk -= 5;
     }
 }
@@ -1760,8 +1682,8 @@ bsr (void)
   monitor_call (0);
 }
 
+/* execute 6809 code */
 
-/* Execute 6809 code for a certain number of cycles. */
 int
 cpu_execute (int cycles)
 {
@@ -1771,13 +1693,11 @@ cpu_execute (int cycles)
 
   do
     {
-	 	command_insn_hook ();
-		if (check_break () != 0)
-			monitor_on = 1;
-
-		if (monitor_on != 0)
-			if (monitor6809 () != 0)
-				goto cpu_exit;
+      if (check_break (PC) != 0)
+	monitor_on = 1;
+      if (monitor_on != 0)
+	if (monitor6809 () != 0)
+	  return cpu_period - cpu_clk;
 
       iPC = PC;
       opcode = imm_byte ();
@@ -2124,7 +2044,7 @@ cpu_execute (int cycles)
 		st16 (S);
 		break;
 	      default:
-	        sim_error ("invalid opcode (1) at %s\n", monitor_addr_name (iPC));
+	        sim_error ("invalid opcode at %s\n", monitor_addr_name (iPC));
 		break;
 	      }
 	  }
@@ -2139,29 +2059,14 @@ cpu_execute (int cycles)
 	      case 0x3f:
 		swi3 ();
 		break;
-#ifdef H6309
-			case 0x80: /* SUBE */
-			case 0x81: /* CMPE */
-#endif
 	      case 0x83:
 		cpu_clk -= 5;
 		cmp16 (U, imm_word ());
 		break;
-#ifdef H6309
-			case 0x86: /* LDE */
-			case 0x8B: /* ADDE */
-#endif
 	      case 0x8c:
 		cpu_clk -= 5;
 		cmp16 (S, imm_word ());
 		break;
-#ifdef H6309
-			case 0x8D: /* DIVD */
-			case 0x8E: /* DIVQ */
-			case 0x8F: /* MULD */
-			case 0x90: /* SUBE */
-			case 0x91: /* CMPE */
-#endif
 	      case 0x93:
 		direct ();
 		cpu_clk -= 5;
@@ -2199,7 +2104,7 @@ cpu_execute (int cycles)
 		cpu_clk--;
 		break;
 	      default:
-	        sim_error ("invalid opcode (2) at %s\n", monitor_addr_name (iPC));
+	        sim_error ("invalid opcode at %s\n", monitor_addr_name (iPC));
 		break;
 	      }
 	  }
@@ -3126,27 +3031,20 @@ cpu_execute (int cycles)
 
 	default:
 	  cpu_clk -= 2;
-     sim_error ("invalid opcode '%02X'\n", opcode);
-     PC = iPC;
+          sim_error ("invalid opcode at %s\n", monitor_addr_name (iPC));
 	  break;
 	}
-
-	if (cc_changed)
-		cc_modified ();
     }
   while (cpu_clk > 0);
 
-cpu_exit:
-   cpu_period -= cpu_clk;
-   cpu_clk = cpu_period;
-   return cpu_period;
+  return cpu_period - cpu_clk;
 }
 
 void
 cpu_reset (void)
 {
   X = Y = S = U = A = B = DP = 0;
-  H = N = OV = C = 0;
+  H = N = V = C = 0;
   Z = 1;
   EFI = F_FLAG | I_FLAG;
 #ifdef H6309
@@ -3154,5 +3052,4 @@ cpu_reset (void)
 #endif
 
   change_pc (read16 (0xfffe));
-  cpu_is_running ();
 }
